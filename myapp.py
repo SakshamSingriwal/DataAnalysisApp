@@ -87,3 +87,16 @@ if file is not None:
         st.subheader("GroupBy Visualization", divider='blue')
         fig = px.bar(result, x=groupby_cols[0], y='newcol', title=f'{operation} of {operation_col}')
         st.plotly_chart(fig)
+
+if 'cleaned_df' not in st.session_state:
+    st.session_state.cleaned_df = data.copy()
+
+df = st.session_state.cleaned_df
+
+st.markdown('### 📋 Current Data Health')
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric(label='Total Rows',     value=f'{df.shape[0]:,}')
+m2.metric(label='Total Columns',  value=f'{df.shape[1]}')
+m3.metric(label='Missing Cells',  value=f'{df.isnull().sum().sum():,}')
+m4.metric(label='Duplicate Rows', value=f'{df.duplicated().sum():,}')

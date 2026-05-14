@@ -1,268 +1,432 @@
+"""
+DataIQ Pro Analytics - Universal File Handler
+
+This module provides universal file reading capabilities for 20+ file formats.
+"""
+
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
-import io
+from typing import Tuple, Dict, Any, Optional
 import os
+import tempfile
 import zipfile
 import sqlite3
-import traceback
+import json
+import chardet
 
-# ── READ ANY FILE AND RETURN A DATAFRAME + METADATA ──────────
-# Returns: (dataframe_or_None, metadata_dict, error_string_or_None)
 
-def read_any_file(file):
-
-    name    = file.name.lower()
-    meta    = {'filename': file.name, 'filetype': None, 'notes': []}
-    raw     = file.read()
-    file.seek(0)
-
+def read_any_file(file) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """
+    Universal file reader that handles 20+ formats.
+    Returns (dataframe_or_None, meta_dict, error_code)
+    
+    Args:
+        file: The uploaded file object from Streamlit.
+    
+    Returns:
+        Tuple of (DataFrame or None, metadata dict, error code string).
+    """
+    meta = {
+        'filename': getattr(file, 'name', 'unknown'),
+        'filesize': getattr(file, 'size', 0),
+        'filetype': '',
+        'ext': '',
+        'notes': [],
+        'trace': ''
+    }
+    
     try:
-
-        # ── CSV ───────────────────────────────────────────────
-        if name.endswith('.csv'):
-            meta['filetype'] = 'CSV'
-            try:
-                df = pd.read_csv(io.BytesIO(raw))
-            except UnicodeDecodeError:
-                df = pd.read_csv(io.BytesIO(raw), encoding='latin-1')
-                meta['notes'].append('Used latin-1 encoding (file had special characters)')
-            return df, meta, None
-
-        # ── EXCEL XLSX ────────────────────────────────────────
-        elif name.endswith('.xlsx'):
-            meta['filetype'] = 'Excel (.xlsx)'
-            xl   = pd.ExcelFile(io.BytesIO(raw), engine='openpyxl')
-            meta['sheets'] = xl.sheet_names
-            if len(xl.sheet_names) == 1:
-                df = xl.parse(xl.sheet_names[0])
-                meta['notes'].append(f"Single sheet: '{xl.sheet_names[0]}'")
-                return df, meta, None
-            else:
-                meta['notes'].append(f"Multiple sheets found: {xl.sheet_names}")
-                meta['multi_sheet'] = True
-                meta['excel_file']  = xl
-                return None, meta, 'MULTI_SHEET'
-
-        # ── OLD EXCEL XLS ─────────────────────────────────────
-        elif name.endswith('.xls'):
-            meta['filetype'] = 'Excel (.xls)'
-            xl   = pd.ExcelFile(io.BytesIO(raw), engine='xlrd')
-            meta['sheets'] = xl.sheet_names
-            if len(xl.sheet_names) == 1:
-                df = xl.parse(xl.sheet_names[0])
-                return df, meta, None
-            else:
-                meta['multi_sheet'] = True
-                meta['excel_file']  = xl
-                return None, meta, 'MULTI_SHEET'
-
-        # ── JSON ──────────────────────────────────────────────
-        elif name.endswith('.json'):
-            meta['filetype'] = 'JSON'
-            try:
-                df = pd.read_json(io.BytesIO(raw))
-            except ValueError:
-                # Try reading as JSON lines format
-                df = pd.read_json(io.BytesIO(raw), lines=True)
-                meta['notes'].append('Parsed as JSON Lines format')
-            return df, meta, None
-
-        # ── PARQUET ───────────────────────────────────────────
-        elif name.endswith('.parquet'):
-            meta['filetype'] = 'Parquet'
-            df = pd.read_parquet(io.BytesIO(raw))
-            meta['notes'].append('Big data columnar format — all columns loaded')
-            return df, meta, None
-
-        # ── TSV (Tab Separated) ───────────────────────────────
-        elif name.endswith('.tsv') or name.endswith('.txt'):
-            meta['filetype'] = 'TSV / TXT'
-            try:
-                df = pd.read_csv(io.BytesIO(raw), sep='\t')
-                meta['notes'].append('Parsed as tab-separated values')
-            except Exception:
-                df = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
-                meta['notes'].append('Auto-detected separator')
-            return df, meta, None
-
-        # ── SQLITE DATABASE ───────────────────────────────────
-        elif name.endswith('.db') or name.endswith('.sqlite') or name.endswith('.sqlite3'):
-            meta['filetype'] = 'SQLite Database'
-            tmp_path = f"_temp_{file.name}"
-            with open(tmp_path, 'wb') as f:
-                f.write(raw)
-            try:
-                conn   = sqlite3.connect(tmp_path)
-                tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)
-                meta['tables'] = tables['name'].tolist()
-                meta['notes'].append(f"Tables found: {meta['tables']}")
-                if len(meta['tables']) == 0:
-                    return None, meta, 'NO_TABLES'
-                meta['multi_table'] = True
-                meta['db_path']     = tmp_path
-                meta['db_conn']     = conn
-                return None, meta, 'MULTI_TABLE'
-            except Exception as e:
-                os.remove(tmp_path)
-                return None, meta, str(e)
-
-        # ── SQL TEXT FILE ─────────────────────────────────────
-        elif name.endswith('.sql'):
-            meta['filetype'] = 'SQL Script'
-            try:
-                sql_text = raw.decode('utf-8')
-            except UnicodeDecodeError:
-                sql_text = raw.decode('latin-1')
-            meta['sql_text'] = sql_text
-            meta['notes'].append('SQL script displayed — not executable data')
-            return None, meta, 'SQL_SCRIPT'
-
-        # ── PYTHON FILE ───────────────────────────────────────
-        elif name.endswith('.py'):
-            meta['filetype'] = 'Python Script'
-            try:
-                py_text = raw.decode('utf-8')
-            except UnicodeDecodeError:
-                py_text = raw.decode('latin-1')
-            meta['py_text'] = py_text
-            meta['notes'].append('Python script displayed — not data')
-            return None, meta, 'PYTHON_SCRIPT'
-
-        # ── PDF ───────────────────────────────────────────────
-        elif name.endswith('.pdf'):
-            meta['filetype'] = 'PDF Document'
-            try:
-                import PyPDF2
-                reader   = PyPDF2.PdfReader(io.BytesIO(raw))
-                n_pages  = len(reader.pages)
-                text     = ''
-                for i, page in enumerate(reader.pages):
-                    try:
-                        text += f"\n--- Page {i+1} ---\n"
-                        text += page.extract_text() or ''
-                    except Exception:
-                        text += f"\n[Could not extract text from page {i+1}]\n"
-                meta['pdf_text'] = text
-                meta['n_pages']  = n_pages
-                meta['notes'].append(f'{n_pages} pages extracted')
-
-                # Try to find tables in the text
-                lines = [l.strip() for l in text.split('\n') if l.strip()]
-                meta['pdf_lines'] = lines
-                return None, meta, 'PDF_FILE'
-            except ImportError:
-                return None, meta, 'PDF_NO_LIB'
-
-        # ── WORD DOCX ─────────────────────────────────────────
-        elif name.endswith('.docx'):
-            meta['filetype'] = 'Word Document (.docx)'
-            try:
-                from docx import Document
-                doc      = Document(io.BytesIO(raw))
-                paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                tables_data = []
-                for table in doc.tables:
-                    rows = []
-                    for row in table.rows:
-                        rows.append([cell.text.strip() for cell in row.cells])
-                    if rows:
-                        try:
-                            tdf = pd.DataFrame(rows[1:], columns=rows[0])
-                            tables_data.append(tdf)
-                        except Exception:
-                            pass
-                meta['doc_paragraphs'] = paragraphs
-                meta['doc_tables']     = tables_data
-                meta['notes'].append(f'{len(paragraphs)} paragraphs, {len(tables_data)} tables found')
-                if tables_data:
-                    meta['notes'].append('Tables extracted and available as DataFrames')
-                    return tables_data[0], meta, None
-                return None, meta, 'DOCX_NO_TABLE'
-            except ImportError:
-                return None, meta, 'DOCX_NO_LIB'
-
-        # ── IMAGE ─────────────────────────────────────────────
-        elif name.endswith(('.png','.jpg','.jpeg','.bmp','.gif','.webp')):
-            meta['filetype'] = 'Image'
-            try:
-                from PIL import Image
-                img = Image.open(io.BytesIO(raw))
-                meta['img_size']   = img.size
-                meta['img_mode']   = img.mode
-                meta['img_object'] = img
-                meta['notes'].append(f'Image: {img.size[0]}×{img.size[1]} px, mode {img.mode}')
-                return None, meta, 'IMAGE_FILE'
-            except ImportError:
-                return None, meta, 'IMAGE_NO_LIB'
-
-        # ── POWER BI PBIX ─────────────────────────────────────
-        elif name.endswith('.pbix'):
-            meta['filetype'] = 'Power BI (.pbix)'
-            try:
-                # pbix is a ZIP archive — we open it and list contents
-                with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                    file_list = z.namelist()
-                    meta['pbix_contents'] = file_list
-                    meta['notes'].append(f'{len(file_list)} internal files found in .pbix archive')
-
-                    # Try to extract the DataModel metadata
-                    data_files = [f for f in file_list if 'DataModel' in f or 'data' in f.lower()]
-                    meta['pbix_data_files'] = data_files
-
-                    # Try reading Connections file for source info
-                    if 'Connections' in file_list:
-                        try:
-                            conn_bytes = z.read('Connections')
-                            meta['pbix_connections'] = conn_bytes.decode('utf-8', errors='replace')
-                        except Exception:
-                            pass
-
-                    # Try reading Report/Layout for page names
-                    if 'Report/Layout' in file_list:
-                        try:
-                            import json
-                            layout_bytes = z.read('Report/Layout')
-                            layout       = json.loads(layout_bytes.decode('utf-8', errors='replace'))
-                            sections     = layout.get('sections', [])
-                            page_names   = [s.get('displayName','') for s in sections]
-                            meta['pbix_pages'] = page_names
-                            meta['notes'].append(f"Report pages: {page_names}")
-                        except Exception:
-                            pass
-
-                return None, meta, 'PBIX_FILE'
-            except zipfile.BadZipFile:
-                return None, meta, 'PBIX_CORRUPT'
-
-        # ── XML ───────────────────────────────────────────────
-        elif name.endswith('.xml'):
-            meta['filetype'] = 'XML'
-            try:
-                df = pd.read_xml(io.BytesIO(raw))
-                meta['notes'].append('Parsed XML into tabular format')
-                return df, meta, None
-            except Exception as e:
-                return None, meta, f'XML parse error: {e}'
-
-        # ── ODS (LibreOffice Spreadsheet) ─────────────────────
-        elif name.endswith('.ods'):
-            meta['filetype'] = 'ODS Spreadsheet'
-            df = pd.read_excel(io.BytesIO(raw), engine='odf')
-            return df, meta, None
-
-        # ── FEATHER ───────────────────────────────────────────
-        elif name.endswith('.feather'):
-            meta['filetype'] = 'Feather'
-            df = pd.read_feather(io.BytesIO(raw))
-            return df, meta, None
-
-        # ── UNKNOWN FILE TYPE ─────────────────────────────────
+        # Get file extension
+        filename = meta['filename'].lower()
+        if '.' in filename:
+            meta['ext'] = filename.split('.')[-1]
         else:
-            meta['filetype'] = 'Unknown'
-            return None, meta, 'UNKNOWN_TYPE'
-
+            meta['ext'] = 'noext'
+        
+        meta['filetype'] = meta['ext'].upper()
+        
+        # Read file content
+        file.seek(0)
+        content = file.read()
+        file.seek(0)  # Reset for pandas reading
+        
+        # Handle different formats
+        if meta['ext'] in ['csv', 'tsv', 'txt']:
+            return _read_text_file(file, content, meta)
+        elif meta['ext'] in ['xlsx', 'xls']:
+            return _read_excel_file(file, meta)
+        elif meta['ext'] == 'json':
+            return _read_json_file(file, content, meta)
+        elif meta['ext'] == 'parquet':
+            return _read_parquet_file(file, meta)
+        elif meta['ext'] in ['db', 'sqlite', 'sqlite3']:
+            return _read_sqlite_file(file, meta)
+        elif meta['ext'] == 'sql':
+            return _read_sql_file(content, meta)
+        elif meta['ext'] in ['py', 'python']:
+            return _read_python_file(content, meta)
+        elif meta['ext'] == 'pdf':
+            return _read_pdf_file(content, meta)
+        elif meta['ext'] == 'docx':
+            return _read_docx_file(file, meta)
+        elif meta['ext'] in ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp', 'tiff']:
+            return _read_image_file(file, meta)
+        elif meta['ext'] == 'pbix':
+            return _read_pbix_file(file, meta)
+        elif meta['ext'] == 'xml':
+            return _read_xml_file(file, meta)
+        elif meta['ext'] == 'ods':
+            return _read_ods_file(file, meta)
+        elif meta['ext'] == 'feather':
+            return _read_feather_file(file, meta)
+        else:
+            meta['notes'].append(f"Unknown file extension: {meta['ext']}")
+            return None, meta, "UNKNOWN_TYPE"
+            
     except Exception as e:
-        meta['error_trace'] = traceback.format_exc()
-        return None, meta, str(e)
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Exception during reading: {str(e)}")
+        return None, meta, "READ_ERROR"
+
+
+def _read_text_file(file, content: bytes, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle CSV, TSV, TXT files with encoding detection."""
+    encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'utf-16']
+    
+    for encoding in encodings_to_try:
+        try:
+            text_content = content.decode(encoding)
+            
+            # Detect separator
+            if meta['ext'] == 'tsv':
+                sep = '\t'
+            elif meta['ext'] == 'csv':
+                # Try to detect separator
+                sample = text_content[:1024]
+                if '\t' in sample and sample.count('\t') > sample.count(','):
+                    sep = '\t'
+                else:
+                    sep = ','
+            else:  # txt
+                # Auto-detect separator
+                sample = text_content[:1024]
+                separators = [',', '\t', ';', '|']
+                sep_counts = [(s, sample.count(s)) for s in separators]
+                sep = max(sep_counts, key=lambda x: x[1])[0]
+            
+            # Read with pandas using StringIO
+            from io import StringIO
+            df = pd.read_csv(StringIO(text_content), sep=sep, engine='python')
+            
+            # Remove fully empty columns
+            df = df.dropna(axis=1, how='all')
+            
+            meta['notes'].append(f"Successfully read with {encoding} encoding, separator '{sep}'")
+            return df, meta, ""
+            
+        except Exception as e:
+            meta['notes'].append(f"Failed with {encoding}: {str(e)}")
+            continue
+    
+    meta['notes'].append("All encodings failed")
+    return None, meta, "CSV_ENCODE_ERROR"
+
+
+def _read_excel_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Excel files (.xlsx, .xls)."""
+    try:
+        if meta['ext'] == 'xlsx':
+            excel_file = pd.ExcelFile(file, engine='openpyxl')
+        else:  # xls
+            excel_file = pd.ExcelFile(file, engine='xlrd')
+        
+        sheet_names = excel_file.sheet_names
+        
+        if len(sheet_names) == 1:
+            df = pd.read_excel(excel_file, sheet_name=sheet_names[0])
+            meta['notes'].append(f"Read single sheet: {sheet_names[0]}")
+            return df, meta, ""
+        else:
+            meta['excel_obj'] = excel_file
+            meta['sheet_names'] = sheet_names
+            meta['notes'].append(f"Multiple sheets found: {sheet_names}")
+            return None, meta, "MULTI_SHEET"
+            
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Excel reading failed: {str(e)}")
+        return None, meta, "EXCEL_ERROR"
+
+
+def _read_json_file(file, content: bytes, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle JSON files."""
+    try:
+        # Try normal JSON first
+        text_content = content.decode('utf-8')
+        data = json.loads(text_content)
+        
+        # Try to convert to DataFrame
+        df = pd.json_normalize(data) if isinstance(data, list) else pd.DataFrame([data])
+        
+        meta['notes'].append("Read as standard JSON")
+        return df, meta, ""
+        
+    except Exception:
+        try:
+            # Try JSON Lines format
+            file.seek(0)
+            df = pd.read_json(file, lines=True)
+            meta['notes'].append("Read as JSON Lines format")
+            return df, meta, ""
+            
+        except Exception as e:
+            meta['trace'] = str(e)
+            meta['notes'].append(f"JSON reading failed: {str(e)}")
+            return None, meta, "JSON_ERROR"
+
+
+def _read_parquet_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Parquet files."""
+    try:
+        df = pd.read_parquet(file)
+        meta['notes'].append("Successfully read Parquet file")
+        return df, meta, ""
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Parquet reading failed: {str(e)}")
+        return None, meta, "PARQUET_ERROR"
+
+
+def _read_sqlite_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle SQLite database files."""
+    temp_path = None
+    try:
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as temp_file:
+            temp_file.write(file.read())
+            temp_path = temp_file.name
+        
+        # Connect and get table list
+        conn = sqlite3.connect(temp_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if not tables:
+            meta['notes'].append("No tables found in database")
+            return None, meta, "NO_TABLES"
+        
+        meta['tables'] = tables
+        meta['db_path'] = temp_path
+        meta['notes'].append(f"Found tables: {tables}")
+        return None, meta, "MULTI_TABLE"
+        
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"SQLite reading failed: {str(e)}")
+        return None, meta, "SQLITE_ERROR"
+    finally:
+        # Cleanup will be handled by caller if needed
+        pass
+
+
+def _read_sql_file(content: bytes, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle SQL files."""
+    try:
+        text_content = content.decode('utf-8')
+        meta['code'] = text_content
+        meta['notes'].append("SQL file detected - contains code/text")
+        return None, meta, "CODE_FILE"
+    except Exception as e:
+        try:
+            text_content = content.decode('latin-1')
+            meta['code'] = text_content
+            meta['notes'].append("SQL file decoded with latin-1")
+            return None, meta, "CODE_FILE"
+        except Exception as e2:
+            meta['trace'] = str(e2)
+            meta['notes'].append(f"SQL file reading failed: {str(e2)}")
+            return None, meta, "SQL_ERROR"
+
+
+def _read_python_file(content: bytes, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Python files."""
+    try:
+        text_content = content.decode('utf-8')
+        meta['code'] = text_content
+        meta['notes'].append("Python file detected - contains code")
+        return None, meta, "CODE_FILE"
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Python file reading failed: {str(e)}")
+        return None, meta, "PYTHON_ERROR"
+
+
+def _read_pdf_file(content: bytes, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle PDF files."""
+    try:
+        from PyPDF2 import PdfReader
+        
+        pdf_file = io.BytesIO(content)
+        reader = PdfReader(pdf_file)
+        
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        
+        meta['text'] = text
+        meta['n_pages'] = len(reader.pages)
+        meta['notes'].append(f"Extracted text from {len(reader.pages)} pages")
+        return None, meta, "PDF_FILE"
+        
+    except ImportError:
+        meta['notes'].append("PyPDF2 not installed")
+        return None, meta, "MISSING_LIB:PyPDF2"
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"PDF reading failed: {str(e)}")
+        return None, meta, "PDF_ERROR"
+
+
+def _read_docx_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Word documents."""
+    try:
+        from docx import Document
+        
+        doc = Document(file)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        
+        # Check for tables
+        tables_data = []
+        for table in doc.tables:
+            table_df = pd.DataFrame()
+            for i, row in enumerate(table.rows):
+                row_data = [cell.text for cell in row.cells]
+                if i == 0:
+                    table_df = pd.DataFrame(columns=row_data)
+                else:
+                    table_df.loc[len(table_df)] = row_data
+            if not table_df.empty:
+                tables_data.append(table_df)
+        
+        if tables_data:
+            df = tables_data[0]  # Return first table
+            meta['notes'].append(f"Found {len(tables_data)} tables, returning first one")
+            return df, meta, ""
+        else:
+            meta['paragraphs'] = paragraphs
+            meta['notes'].append(f"No tables found, extracted {len(paragraphs)} paragraphs")
+            return None, meta, "DOCX_TEXT"
+            
+    except ImportError:
+        meta['notes'].append("python-docx not installed")
+        return None, meta, "MISSING_LIB:python-docx"
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Word reading failed: {str(e)}")
+        return None, meta, "DOCX_ERROR"
+
+
+def _read_image_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle image files."""
+    try:
+        from PIL import Image
+        import io
+        
+        image = Image.open(file)
+        meta['pil_image'] = image
+        meta['size'] = image.size
+        meta['mode'] = image.mode
+        meta['format'] = image.format
+        meta['notes'].append(f"Image: {image.format} {image.size} {image.mode}")
+        return None, meta, "IMAGE_FILE"
+        
+    except ImportError:
+        meta['notes'].append("Pillow not installed")
+        return None, meta, "MISSING_LIB:Pillow"
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Image reading failed: {str(e)}")
+        return None, meta, "IMAGE_ERROR"
+
+
+def _read_pbix_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Power BI files."""
+    try:
+        import zipfile
+        import json
+        
+        pbix_zip = zipfile.ZipFile(file)
+        contents = pbix_zip.namelist()
+        
+        # Try to extract Report/Layout
+        report_data = None
+        connections_data = None
+        
+        if 'Report/Layout' in contents:
+            with pbix_zip.open('Report/Layout') as f:
+                report_content = f.read().decode('utf-8')
+                report_data = json.loads(report_content)
+        
+        if 'Connections' in contents:
+            with pbix_zip.open('Connections') as f:
+                connections_content = f.read().decode('utf-8')
+                connections_data = json.loads(connections_content)
+        
+        meta['contents'] = contents
+        meta['report_data'] = report_data
+        meta['connections_data'] = connections_data
+        
+        if report_data and 'sections' in report_data:
+            page_names = [section.get('displayName', 'Unknown') for section in report_data['sections']]
+            meta['page_names'] = page_names
+            meta['notes'].append(f"Power BI file with pages: {page_names}")
+        else:
+            meta['notes'].append("Power BI file contents extracted")
+        
+        return None, meta, "PBIX_FILE"
+        
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Power BI reading failed: {str(e)}")
+        return None, meta, "PBIX_ERROR"
+
+
+def _read_xml_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle XML files."""
+    try:
+        df = pd.read_xml(file)
+        meta['notes'].append("Successfully read XML file")
+        return df, meta, ""
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"XML reading failed: {str(e)}")
+        return None, meta, "XML_ERROR"
+
+
+def _read_ods_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle ODS files."""
+    try:
+        df = pd.read_excel(file, engine='odf')
+        meta['notes'].append("Successfully read ODS file")
+        return df, meta, ""
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"ODS reading failed: {str(e)}")
+        return None, meta, "ODS_ERROR"
+
+
+def _read_feather_file(file, meta: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+    """Handle Feather files."""
+    try:
+        df = pd.read_feather(file)
+        meta['notes'].append("Successfully read Feather file")
+        return df, meta, ""
+    except Exception as e:
+        meta['trace'] = str(e)
+        meta['notes'].append(f"Feather reading failed: {str(e)}")
+        return None, meta, "FEATHER_ERROR"
     

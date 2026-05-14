@@ -16,7 +16,7 @@ lightgbm>=4.0.0
 catboost>=1.2.0
 
 # Deep learning (optional)
-tensorflow>=2.13.0
+tensorflow
 
 # Additional file format support
 python-docx>=0.8.11   # for Word documents
